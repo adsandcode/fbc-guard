@@ -1,0 +1,50 @@
+name: release
+
+# Push a tag like v0.1.1 to publish. npm uses trusted publishing (OIDC), so no
+# npm token is stored anywhere; the MCP Registry login uses the same OIDC token.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11
+
+      - name: Tag, package.json and server.json must agree
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          SRV="$(node -p "require('./server.json').version")"
+          echo "tag=$TAG package=$PKG server=$SRV"
+          test "$TAG" = "$PKG" && test "$TAG" = "$SRV"
+
+      - run: npm ci
+
+      # prepublishOnly builds, runs the selftest, the smoke test and the publish checks.
+      - run: npm publish --access public
+
+      - name: Install mcp-publisher (pinned, checksum verified)
+        run: |
+          V=1.8.1
+          F=mcp-publisher_linux_amd64.tar.gz
+          curl -fsSL -o "$F" "https://github.com/modelcontextprotocol/registry/releases/download/v$V/$F"
+          curl -fsSL -o sums.txt "https://github.com/modelcontextprotocol/registry/releases/download/v$V/registry_${V}_checksums.txt"
+          grep " $F\$" sums.txt | sha256sum -c -
+          tar xzf "$F" mcp-publisher
+
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish
