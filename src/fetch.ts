@@ -9,6 +9,8 @@
  * not scanned.
  */
 
+import type { Source } from "./jsscan.js";
+
 export const LIMITS = Object.freeze({
   timeoutMs: 30_000,
   maxScripts: 20,
@@ -34,8 +36,8 @@ export interface ScriptPlan {
 export interface FetchedBundle {
   /** URL of the page after redirects. Same-origin is judged against this. */
   finalUrl: string;
-  /** Page HTML followed by every same-origin script that was fetched. */
-  code: string;
+  /** The page as HTML, then every same-origin script that was fetched, as JavaScript. */
+  sources: Source[];
   /** Same-origin script URLs that were fetched and included in `code`. */
   scripts: string[];
   /** Script URLs that were not scanned, with the reason. */
@@ -188,16 +190,16 @@ export async function fetchBundle(target: string): Promise<FetchedBundle> {
     }),
   );
 
-  const parts = [html];
+  const sources: Source[] = [{ code: html, kind: "html" }];
   const scripts: string[] = [];
   const skipped = [...plan.skipped];
   for (const b of bodies) {
     if (b.body !== null) {
-      parts.push(b.body);
+      sources.push({ code: b.body, kind: "js" });
       scripts.push(b.src);
     } else {
       skipped.push({ url: b.src, reason: b.error });
     }
   }
-  return { finalUrl, code: parts.join("\n"), scripts, skipped };
+  return { finalUrl, sources, scripts, skipped };
 }

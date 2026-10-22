@@ -10,6 +10,7 @@
 
 import { checkCode, RULES, type RuleId, type Status } from "./rules.js";
 import { planScripts } from "./fetch.js";
+import { maskJs, statementEnd } from "./jsscan.js";
 
 /** Original known-bad fixture: writes only when the cookie is missing, decodes twice, hard-codes subdomainIndex. */
 export const BAD_FIXTURE = String.raw`<script>
@@ -83,57 +84,135 @@ const COND = "if(fbclid && curId!==fbclid){";
 const WRITE = "document.cookie='_fbc=fb.'+sdi+'.'+Date.now()+'.'+fbclid+';path=/;domain=.'+root;";
 const READ = "var ck=document.cookie;";
 
+
+// Fixtures in the shape of a minimal hand-written snippet: f holds the URL
+// click ID, id the click ID stored in _fbc, i the subdomainIndex.
+const HEAD =
+  "var f=new URLSearchParams(location.search).get('fbclid');" +
+  "var c=(document.cookie.match(/_fbc=([^;]*)/)||[])[1]||'';" +
+  "var id=c.split('.')[3]||'';" +
+  "var i=location.hostname.split('.').length-1;";
+const snippet = (body: string) => `<script>${HEAD}${body}</script>`;
+const WRITE_MS = "if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+f;}";
+
+/** Writes creationTime in seconds through Math.floor(Date.now()/1000). Must fail FBC-05 and nothing else. */
+export const SNIPPET_SECONDS =
+  "<script>var f=new URLSearchParams(location.search).get('fbclid');var c=(document.cookie.match(/_fbc=([^;]*)/)||[])[1]||'';var id=c.split('.')[3]||'';var i=location.hostname.split('.').length-1;if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor(Date.now()/1000)+'.'+f;}</script>";
+/** The same snippet with Date.now(). Must pass every rule. */
+export const SNIPPET_MS = SNIPPET_SECONDS.replace("Math.floor(Date.now()/1000)", "Date.now()");
+
 export interface CodeCase {
   name: string;
   code: string;
   expectStatus: Status;
   expectFailed: RuleId[];
+  expectUnknown?: RuleId[];
 }
+
+const fails = (rule: RuleId) => ({ expectStatus: "fail" as const, expectFailed: [rule] });
+const passes = { expectStatus: "pass" as const, expectFailed: [] };
 
 export const CODE_CASES: CodeCase[] = [
   { name: "original bad fixture", code: BAD_FIXTURE, expectStatus: "fail", expectFailed: ["FBC-01", "FBC-02", "FBC-06"] },
-  { name: "original good fixture", code: GOOD_FIXTURE, expectStatus: "pass", expectFailed: [] },
-  { name: "README example", code: README_EXAMPLE, expectStatus: "pass", expectFailed: [] },
+  { name: "original good fixture", code: GOOD_FIXTURE, ...passes },
+  { name: "README example", code: README_EXAMPLE, ...passes },
+
+  // One fixture per rule, each a one-change variant of the original good fixture.
+  { name: "FBC-01 only: writes the cookie only when it is missing", code: variant(COND, "if(fbclid && ck.indexOf('_fbc=')<0){"), ...fails("FBC-01") },
+  { name: "FBC-01 only: never compares the stored ID with the URL fbclid", code: variant(COND, "if(fbclid && !curFbc){"), ...fails("FBC-01") },
+  { name: "FBC-02 only: decodes fbclid a second time", code: variant(WRITE, WRITE.replace("+fbclid+", "+decodeURIComponent(fbclid)+")), ...fails("FBC-02") },
+  { name: "FBC-03 only: lower-cases fbclid", code: variant(READ, "fbclid=fbclid&&fbclid.toLowerCase();\n" + READ), ...fails("FBC-03") },
+  { name: "FBC-04 only: truncates fbclid", code: variant(READ, "fbclid=fbclid&&fbclid.slice(0,100);\n" + READ), ...fails("FBC-04") },
   {
-    name: "FBC-01 only: writes the cookie only when it is missing",
-    code: variant(COND, "if(fbclid && ck.indexOf('_fbc=')<0){"),
-    expectStatus: "fail", expectFailed: ["FBC-01"],
-  },
-  {
-    name: "FBC-01 only: never compares the stored ID with the URL fbclid",
-    code: variant(COND, "if(fbclid && !curFbc){"),
-    expectStatus: "fail", expectFailed: ["FBC-01"],
-  },
-  {
-    name: "FBC-02 only: decodes fbclid a second time",
-    code: variant(WRITE, WRITE.replace("+fbclid+", "+decodeURIComponent(fbclid)+")),
-    expectStatus: "fail", expectFailed: ["FBC-02"],
-  },
-  {
-    name: "FBC-03 only: lower-cases fbclid",
-    code: variant(READ, "fbclid=fbclid&&fbclid.toLowerCase();\n" + READ),
-    expectStatus: "fail", expectFailed: ["FBC-03"],
-  },
-  {
-    name: "FBC-04 only: truncates fbclid",
-    code: variant(READ, "fbclid=fbclid&&fbclid.slice(0,100);\n" + READ),
-    expectStatus: "fail", expectFailed: ["FBC-04"],
-  },
-  {
-    name: "FBC-05 only: _fbc creationTime in seconds",
+    name: "FBC-05 only: _fbc creationTime in seconds, template literal",
     code: variant(WRITE, "document.cookie=`_fbc=fb.${sdi}.${Math.floor(Date.now()/1000)}.${fbclid};path=/;domain=.${root}`;"),
-    expectStatus: "fail", expectFailed: ["FBC-05"],
+    ...fails("FBC-05"),
   },
+  { name: "FBC-06 only: hard-coded subdomainIndex", code: variant(WRITE, WRITE.replace("'_fbc=fb.'+sdi+'.'", "'_fbc=fb.1.'")), ...fails("FBC-06") },
   {
-    name: "FBC-06 only: hard-coded subdomainIndex",
-    code: variant(WRITE, WRITE.replace("'_fbc=fb.'+sdi+'.'", "'_fbc=fb.1.'")),
-    expectStatus: "fail", expectFailed: ["FBC-06"],
-  },
-  {
-    name: "FBP-01 only: _fbp creationTime in seconds",
+    name: "FBP-01 only: _fbp creationTime in seconds, template literal",
     code: variant(WRITE, WRITE + "\n  document.cookie=`_fbp=fb.${sdi}.${Math.floor(Date.now()/1000)}.${Math.floor(Math.random()*1e10)};path=/`;"),
-    expectStatus: "fail", expectFailed: ["FBP-01"],
+    ...fails("FBP-01"),
   },
+
+  // FBC-05: every way of writing seconds must fail, and only FBC-05.
+  { name: "FBC-05 seconds: Math.floor(Date.now()/1000) concatenated", code: SNIPPET_SECONDS, ...fails("FBC-05") },
+  { name: "FBC-05 seconds: Date.now()/1e3|0", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+(Date.now()/1e3|0)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: ~~((new Date).getTime()/1000)", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+~~((new Date).getTime()/1000)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: Math.round(new Date().valueOf()/1000)", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.round(new Date().valueOf()/1000)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: Math.trunc( Date.now() / 1000 ) with spaces", code: snippet("if (f && id !== f) { document.cookie = '_fbc=fb.' + i + '.' + Math.trunc( Date.now() / 1000 ) + '.' + f; }"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: parseInt(Date.now()/1000,10)", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+parseInt(Date.now()/1000,10)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: inside a template literal", code: snippet("if(f&&id!==f){document.cookie=`_fbc=fb.${i}.${Math.floor(Date.now()/1000)}.${f}`;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: stored in a variable first", code: snippet("var ts=Math.floor(Date.now()/1000);if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+ts+'.'+f;}"), ...fails("FBC-05") },
+  {
+    name: "FBC-05 seconds: statement split across lines",
+    code: snippet("\nif (f && id !== f) {\n  document.cookie = '_fbc=fb.' + i + '.' +\n    Math.floor(Date.now() / 1000) + '.' + f;\n}\n"),
+    ...fails("FBC-05"),
+  },
+  {
+    name: "FBC-05 seconds: a URL string with // earlier on the line",
+    code: snippet("var home='https://example.com/';if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor(Date.now()/1000)+'.'+f;}"),
+    ...fails("FBC-05"),
+  },
+
+  // FBP-01 variants.
+  { name: "FBP-01 seconds: concatenated", code: snippet(WRITE_MS + "document.cookie='_fbp=fb.'+i+'.'+Math.floor(Date.now()/1000)+'.'+Math.floor(Math.random()*1e10);"), ...fails("FBP-01") },
+  { name: "FBP-01 seconds: +new Date/1000 stored in a variable", code: snippet("var now=Math.round(+new Date/1000);" + WRITE_MS + "document.cookie='_fbp=fb.'+i+'.'+now+'.'+Math.floor(Math.random()*1e10);"), ...fails("FBP-01") },
+
+  // Millisecond code must pass, whatever else in the file divides by 1000.
+  { name: "ms: Date.now() concatenated", code: SNIPPET_MS, ...passes },
+  { name: "ms: countdown timers with /1000 elsewhere in the script", code: snippet("var end=Date.now()+60000;var left=Math.floor((end-Date.now())/1000);var secs=Math.floor(Date.now()/1000);" + WRITE_MS + "var later=Math.floor(Date.now()/1000);"), ...passes },
+  {
+    name: "ms: no semicolons, seconds timer on the next line",
+    code: snippet("\nconst g = f\nif (g && id !== g) document.cookie = `_fbc=fb.${i}.${Date.now()}.${g}`\nconst secondsLeft = Math.floor(Date.now() / 1000)\n"),
+    ...passes,
+  },
+  { name: "ms: Date.now() stored in a variable first", code: snippet("var ts=Date.now();if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+ts+'.'+f;}"), ...passes },
+  { name: "ms: variable reassigned from seconds to milliseconds before use", code: snippet("var ts=Math.floor(Date.now()/1000);showTimer(ts);ts=Date.now();if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+ts+'.'+f;}"), ...passes },
+  { name: "ms: a seconds variable named now, cookie uses Date.now()", code: snippet("var now=Math.floor(Date.now()/1000);" + WRITE_MS), ...passes },
+  { name: "ms: commented-out seconds line", code: snippet("\n// document.cookie='_fbc=fb.'+i+'.'+Math.floor(Date.now()/1000)+'.'+f;\n" + WRITE_MS), ...passes },
+  { name: "ms: max-age computed from a time difference in the same statement", code: snippet("var exp=Date.now()+7776e6;if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+f+';max-age='+Math.floor((exp-Date.now())/1000);}"), ...passes },
+
+  // FBC-01: which variable holds the URL click ID, and is it compared with the stored one.
+  {
+    name: "FBC-01 pass: clickId from a regex on fbclid=, compared with !=",
+    code: "<script>var clickId=(location.search.match(/[?&]fbclid=([^&]+)/)||[])[1];var stored=((document.cookie.match(/_fbc=([^;]*)/)||[])[1]||'').split('.')[3];var i=location.hostname.split('.').length-1;if(clickId&&stored!=clickId){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+clickId;}</script>",
+    ...passes,
+  },
+  {
+    name: "FBC-01 pass: fbclid from split('fbclid='), === with early return",
+    code: "(function(){var fbclid=location.search.split('fbclid=')[1];if(!fbclid)return;fbclid=fbclid.split('&')[0];var cur=((document.cookie.match(/_fbc=([^;]*)/)||[])[1]||'').split('.')[3];if(cur===fbclid)return;document.cookie='_fbc=fb.'+(location.hostname.split('.').length-1)+'.'+Date.now()+'.'+fbclid;})();",
+    ...passes,
+  },
+  {
+    name: "FBC-01 pass: click from .get(\"fbclid\"), stored !== click",
+    code: '<script>var click=new URLSearchParams(location.search).get("fbclid");var storedId=((document.cookie.match(/_fbc=([^;]*)/)||[])[1]||"").split(".")[3];if(click&&storedId!==click){document.cookie="_fbc=fb."+(location.hostname.split(".").length-1)+"."+Date.now()+"."+click;}</script>',
+    ...passes,
+  },
+  { name: "FBC-01 pass: missing-or-different, indexOf combined with a comparison", code: snippet("if(f&&(document.cookie.indexOf('_fbc=')<0||id!==f)){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+f;}"), ...passes },
+  { name: "FBC-01 fail: f never compared", code: snippet("if(f){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+f;}"), ...fails("FBC-01") },
+  {
+    name: "FBC-01 fail: clickId only compared with literals",
+    code: "<script>var clickId=(location.search.match(/[?&]fbclid=([^&]+)/)||[])[1];var i=location.hostname.split('.').length-1;if(clickId!==''&&clickId!=null){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+clickId;}</script>",
+    ...fails("FBC-01"),
+  },
+  { name: "FBC-01 fail: f with the write-only-if-missing pattern", code: snippet("if(f&&document.cookie.indexOf('_fbc=')<0){document.cookie='_fbc=fb.'+i+'.'+Date.now()+'.'+f;}"), ...fails("FBC-01") },
+  {
+    name: "FBC-01 fail: write-only-if-missing, click ID variable not resolvable",
+    code: "<script>var x=readClickId();if(x&&document.cookie.indexOf('_fbc=')<0){document.cookie='_fbc=fb.'+sdi()+'.'+Date.now()+'.'+x;}</script>",
+    ...fails("FBC-01"),
+  },
+  {
+    name: "FBC-01 unknown: click ID comes from a function call",
+    code: "<script>var x=readClickId();var s=storedClickId();if(x&&s!==x){document.cookie='_fbc=fb.'+sdi()+'.'+Date.now()+'.'+x;}</script>",
+    expectStatus: "unknown", expectFailed: [], expectUnknown: ["FBC-01"],
+  },
+  {
+    name: "FBC-01 unknown: click ID is a parameter not named fbclid",
+    code: "function saveClick(cid){var s=storedClickId();if(s!==cid){document.cookie='_fbc=fb.'+sdi()+'.'+Date.now()+'.'+cid;}}",
+    expectStatus: "unknown", expectFailed: [], expectUnknown: ["FBC-01"],
+  },
+
   {
     name: "no _fbc at all is not applicable, even with a broken fbclid line",
     code: "<script>var fbclid=new URLSearchParams(location.search).get('fbclid');sessionStorage.setItem('click',fbclid.toLowerCase());</script>",
@@ -190,6 +269,15 @@ export const PLAN_CASES: PlanCase[] = [
   },
 ];
 
+/** Semicolons inside strings, regexes, template text and comments must not end a statement. */
+const SCANNER_CASES = [
+  { name: "string", src: "a='x;y'+b;c", statement: "a='x;y'+b" },
+  { name: "regex literal", src: "a=s.match(/;[^;]*/g);c", statement: "a=s.match(/;[^;]*/g)" },
+  { name: "template literal with an expression", src: "a=`;${b+';'}`+c;d", statement: "a=`;${b+';'}`+c" },
+  { name: "comment", src: "a=b // x;y\n;c", statement: "a=b // x;y" },
+  { name: "line break after an operator continues", src: "a=b+\nc\nd", statement: "a=b+\nc" },
+];
+
 const same = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -201,12 +289,21 @@ export function run(log: (s: string) => void = console.log): boolean {
     log(`    [${ok ? "ok" : "FAIL"}] ${line}`);
   };
 
+  log("  scanner");
+  for (const c of SCANNER_CASES) {
+    const got = c.src.slice(0, statementEnd(maskJs(c.src), 0));
+    record(got === c.statement, `statement ${JSON.stringify(got)}  ${c.name}`);
+  }
+
   log("  rules");
   for (const c of CODE_CASES) {
     const r = checkCode(c.code);
-    const ok = r.status === c.expectStatus && same(r.failed, c.expectFailed);
-    const want = `${c.expectStatus} [${c.expectFailed.join(",")}]`;
-    const got = `${r.status} [${r.failed.join(",")}]`;
+    const expectUnknown = c.expectUnknown ?? [];
+    const ok = r.status === c.expectStatus && same(r.failed, c.expectFailed) && same(r.unknown, expectUnknown);
+    const fmt = (s: string, f: readonly string[], u: readonly string[]) =>
+      `${s} [${f.join(",")}]` + (u.length ? ` ?[${u.join(",")}]` : "");
+    const want = fmt(c.expectStatus, c.expectFailed, expectUnknown);
+    const got = fmt(r.status, r.failed, r.unknown);
     record(ok, `expected ${want.padEnd(30)} got ${got.padEnd(30)} ${c.name}`);
   }
 

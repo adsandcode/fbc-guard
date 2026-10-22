@@ -6,14 +6,17 @@
  *   fbc-guard --json <url|file>  same, machine-readable output
  *   fbc-guard --selftest         run only the negative tests
  *
- * Exit codes: 0 every target passed or had no _fbc code, 1 a rule failed,
- * 2 the negative tests failed, the arguments were invalid, or a target could
- * not be read. The negative tests run before any target is judged.
+ * Exit codes: 0 no rule failed (every target passed, had a rule that could not
+ * decide, or had no _fbc code), 1 a rule failed, 2 the negative tests failed,
+ * the arguments were invalid, or a target could not be read. The negative
+ * tests run before any target is judged.
  */
 
 import { readFileSync } from "node:fs";
 
-import { checkCode, type CheckResult } from "./rules.js";
+import { extname } from "node:path";
+
+import { checkCode, type CheckResult, type Source } from "./rules.js";
 import { fetchBundle, type Skipped } from "./fetch.js";
 import { run as runSelftest } from "./selftest.js";
 
@@ -32,7 +35,8 @@ Usage:
 URLs are fetched together with their same-origin <script src> files.
 Local files are scanned as they are; list your .js files too.
 
-Exit codes: 0 pass (or no _fbc code found), 1 a rule failed,
+Exit codes: 0 no rule failed (pass, unknown, or no _fbc code found),
+            1 a rule failed,
             2 self-test failed, bad arguments, or a target could not be read.`;
 
 type Kind = "url" | "file";
@@ -49,17 +53,29 @@ interface TargetResult extends Partial<Omit<CheckResult, "status">> {
 
 const isUrl = (t: string) => /^https?:\/\//i.test(t);
 
+const JS_EXT = new Set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"]);
+const HTML_EXT = new Set([".html", ".htm", ".xhtml", ".shtml", ".php"]);
+
+/** Read a local file; the extension decides HTML or JavaScript, otherwise the first character does. */
+function fileSource(path: string): Source {
+  const code = readFileSync(path, "utf8");
+  const ext = extname(path).toLowerCase();
+  if (JS_EXT.has(ext)) return { code, kind: "js" };
+  if (HTML_EXT.has(ext)) return { code, kind: "html" };
+  return { code };
+}
+
 async function checkTarget(target: string): Promise<TargetResult> {
   const kind: Kind = isUrl(target) ? "url" : "file";
   try {
     if (kind === "url") {
       const b = await fetchBundle(target);
       return {
-        target, kind, ...checkCode(b.code),
+        target, kind, ...checkCode(b.sources),
         final_url: b.finalUrl, scanned_scripts: b.scripts, skipped_scripts: b.skipped,
       };
     }
-    return { target, kind, ...checkCode(readFileSync(target, "utf8")) };
+    return { target, kind, ...checkCode([fileSource(target)]) };
   } catch (err) {
     return { target, kind, status: "error", error: err instanceof Error ? err.message : String(err) };
   }
@@ -84,6 +100,9 @@ function printText(r: TargetResult): void {
   for (const rule of r.rules ?? []) {
     if (rule.status === "pass") {
       console.log(`  [ ok ] ${rule.id}  ${rule.title}`);
+    } else if (rule.status === "unknown") {
+      console.log(`  [ ?? ] ${rule.id}  ${rule.title}`);
+      console.log(`         could not decide: ${rule.evidence}`);
     } else {
       console.log(`  [FAIL] ${rule.id}  ${rule.title}`);
       console.log(`         why: ${rule.protects}`);
@@ -149,9 +168,11 @@ async function main(argv: string[]): Promise<number> {
     console.log(JSON.stringify({ tool: "fbc-guard", version: VERSION, selftest: "passed", exit_code: exit, results }, null, 2));
   } else {
     console.log(
-      `\n${results.length} target(s): ${count("pass")} pass, ${count("fail")} fail, ` +
+      `\n${results.length} target(s): ${count("pass")} pass, ${count("fail")} fail, ${count("unknown")} unknown, ` +
         `${count("not_applicable")} not applicable, ${count("error")} error`,
     );
+    if (count("unknown"))
+      console.log("unknown = no rule failed, but at least one rule could not decide. It is not a full pass.");
     if (count("not_applicable"))
       console.log("not applicable = no _fbc code was found, so nothing was judged. It is not a pass.");
   }

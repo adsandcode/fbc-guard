@@ -34,7 +34,7 @@ const text = (payload: unknown) => ({
 const RULE_SUMMARY = RULES.map((r) => `${r.id}: ${r.title}.`).join(" ");
 
 const RESULT_SHAPE =
-  'Returns JSON with `status` ("pass", "fail" or "not_applicable"), `failed` (rule IDs), and `rules` (one entry per rule with status, evidence, what it protects against, and a link to Meta\'s documentation). "not_applicable" means no `_fbc` appeared in the content, so nothing was judged; it is not a pass.';
+  'Returns JSON with `status` ("pass", "fail", "unknown" or "not_applicable"), `failed` and `unknown` (rule IDs), and `rules` (one entry per rule with status, evidence, what it protects against, and a link to Meta\'s documentation). "unknown" means no rule failed but at least one could not decide, for example FBC-01 when it cannot tell which variable holds the fbclid from the URL. "not_applicable" means no `_fbc` appeared in the content, so nothing was judged. Neither is a pass.';
 
 const server = new McpServer({ name: "fbc-guard", version: VERSION });
 
@@ -45,11 +45,13 @@ server.tool(
     "keeping an old click ID when a visitor arrives from a new ad, decoding, re-casing or truncating the click ID, writing creationTime in seconds instead of milliseconds, and hard-coding subdomainIndex. " +
     `Rules: ${RULE_SUMMARY} ` +
     RESULT_SHAPE +
-    " This is regular-expression analysis of source text: minified, bundled or obfuscated code can hide a mistake, so a pass is not proof of correctness.",
+    " This is static analysis of source text, not execution: minified, bundled or obfuscated code can hide a mistake, so a pass is not proof of correctness.",
   {
     code: z.string().describe("HTML or JavaScript source to check. Include every file that touches fbclid, _fbc or _fbp, concatenated."),
+    kind: z.enum(["auto", "html", "js"]).default("auto")
+      .describe('How to read `code`. "html": analyse the inline <script> bodies. "js": analyse it as JavaScript. "auto": HTML if it starts with "<", JavaScript otherwise.'),
   },
-  async ({ code }) => text(checkCode(code)),
+  async ({ code, kind }) => text(checkCode([kind === "auto" ? { code } : { code, kind }])),
 );
 
 server.tool(
@@ -68,7 +70,7 @@ server.tool(
       return text({
         url,
         final_url: bundle.finalUrl,
-        ...checkCode(bundle.code),
+        ...checkCode(bundle.sources),
         scanned_scripts: bundle.scripts,
         skipped_scripts: bundle.skipped,
       });

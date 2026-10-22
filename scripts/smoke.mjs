@@ -10,7 +10,9 @@ import { createServer } from "node:http";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dist = resolve(here, "..", "dist");
-const { BAD_FIXTURE, GOOD_FIXTURE } = await import(pathToFileURL(resolve(dist, "selftest.js")).href);
+const { BAD_FIXTURE, GOOD_FIXTURE, SNIPPET_SECONDS, SNIPPET_MS, CODE_CASES } = await import(
+  pathToFileURL(resolve(dist, "selftest.js")).href
+);
 
 const transport = new StdioClientTransport({ command: process.execPath, args: [resolve(dist, "index.js")] });
 const client = new Client({ name: "fbc-guard-smoke", version: "0.0.0" });
@@ -40,6 +42,22 @@ expect("good code failed rules", good.failed, []);
 
 const none = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: "<p>no tracking here</p>" } }));
 expect("code without _fbc", none.status, "not_applicable");
+
+const secs = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: SNIPPET_SECONDS } }));
+expect("seconds snippet", [secs.status, secs.failed], ["fail", ["FBC-05"]]);
+const ms = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: SNIPPET_MS } }));
+expect("milliseconds snippet", [ms.status, ms.failed, ms.unknown], ["pass", [], []]);
+
+const unresolvable = CODE_CASES.find((c) => c.expectStatus === "unknown");
+const unk = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: unresolvable.code } }));
+expect("unresolvable click ID is unknown, not a failure", [unk.status, unk.failed, unk.unknown], ["unknown", [], ["FBC-01"]]);
+
+// The same JavaScript without <script> tags, read as HTML, has no script to analyse.
+const bare = SNIPPET_SECONDS.replace(/<\/?script>/g, "");
+const asJs = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: bare, kind: "js" } }));
+expect("kind js reads bare JavaScript", asJs.failed, ["FBC-05"]);
+const asHtml = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: bare, kind: "html" } }));
+expect("kind html finds no inline script in bare JavaScript", asHtml.failed, []);
 
 const badUrl = await client.callTool({ name: "check_fbc_url", arguments: { url: "ftp://example.com/" } });
 expect("non-http URL is refused", [parse(badUrl).status, badUrl.isError === true], ["error", true]);
