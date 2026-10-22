@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.adsandcode/fbc-guard",
+  "description": "Static checks for Meta _fbc, _fbp and fbclid code that cause modified click ID warnings.",
+  "repository": {
+    "url": "https://github.com/adsandcode/fbc-guard",
+    "source": "github"
+  },
+  "websiteUrl": "https://adsandcode.com/en/open-source/fbc-guard/",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mcp-server-fbc-guard",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
