@@ -7,7 +7,8 @@
  * Events Manager has started warning about it.
  *
  * check_fbc_code is pure: code in, verdict out. check_fbc_url makes network
- * requests: the page itself, then same-origin scripts only.
+ * requests: the page itself, then same-origin scripts only, to public hosts
+ * only unless FBC_GUARD_ALLOW_PRIVATE=1 is set (see fetch.ts).
  *
  * The negative tests run once at startup and the server refuses to start if
  * they fail, because a checker that cannot prove it still catches known-bad
@@ -27,6 +28,9 @@ const VERSION: string = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ).version;
 
+/** Opt-in for checking pages on localhost or a private network. Off unless set to exactly "1". */
+const ALLOW_PRIVATE = process.env.FBC_GUARD_ALLOW_PRIVATE === "1";
+
 const text = (payload: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
 });
@@ -34,7 +38,7 @@ const text = (payload: unknown) => ({
 const RULE_SUMMARY = RULES.map((r) => `${r.id}: ${r.title}.`).join(" ");
 
 const RESULT_SHAPE =
-  'Returns JSON with `status` ("pass", "fail", "unknown" or "not_applicable"), `failed` and `unknown` (rule IDs), and `rules` (one entry per rule with status, evidence, what it protects against, and a link to Meta\'s documentation). "unknown" means no rule failed but at least one could not decide, for example FBC-01 when it cannot tell which variable holds the fbclid from the URL. "not_applicable" means no `_fbc` appeared in the content, so nothing was judged. Neither is a pass.';
+  'Returns JSON with `status` ("pass", "fail", "unknown" or "not_applicable"), `failed`, `unknown` and `warnings` (rule IDs), and `rules` (one entry per rule with status "pass", "fail", "unknown" or "warn", evidence, what it protects against, severity, and a link to Meta\'s documentation). "unknown" means no rule failed but at least one could not decide, for example FBC-01 when it cannot tell which variable holds the fbclid from the URL. "not_applicable" means no `_fbc` appeared in the content, so nothing was judged. Neither is a pass. "warn" comes from a warning-level rule (FBC-06) and never changes the overall status.';
 
 const server = new McpServer({ name: "fbc-guard", version: VERSION });
 
@@ -59,6 +63,9 @@ server.tool(
   "Fetch a landing page and run the same checks as check_fbc_code on its HTML plus every same-origin <script src> it loads, so tracking code kept in an external file is included. " +
     `Cross-origin scripts (tag managers, the Meta Pixel, analytics SDKs) are never fetched and are listed under skipped_scripts. Limits: ${LIMITS.timeoutMs / 1000} s timeout per request, at most ${LIMITS.maxScripts} scripts, ${LIMITS.maxBytes / 1024 / 1024} MB per file. ` +
     "Uses a mobile Safari user agent. " +
+    (ALLOW_PRIVATE
+      ? "This server was started with FBC_GUARD_ALLOW_PRIVATE=1, so loopback and private-network URLs are allowed. "
+      : "Only public hosts are fetched: URLs that resolve to loopback, private, link-local or other internal addresses are refused, on every redirect hop too (start the server with FBC_GUARD_ALLOW_PRIVATE=1 to check local pages). ") +
     RESULT_SHAPE +
     " Also returns final_url (after redirects), scanned_scripts and skipped_scripts.",
   {
@@ -66,7 +73,7 @@ server.tool(
   },
   async ({ url }) => {
     try {
-      const bundle = await fetchBundle(url);
+      const bundle = await fetchBundle(url, { allowPrivate: ALLOW_PRIVATE });
       return text({
         url,
         final_url: bundle.finalUrl,

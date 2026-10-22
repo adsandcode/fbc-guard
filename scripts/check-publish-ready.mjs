@@ -9,6 +9,7 @@
  * until a version is published and immutable, so it is checked here.
  */
 import { readFileSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -61,6 +62,29 @@ if (existsSync(resolve(root, "dist/selftest.js")) && existsSync(resolve(root, "R
   const readme = readFileSync(resolve(root, "README.md"), "utf8").replace(/\r\n/g, "\n");
   if (!readme.includes(README_EXAMPLE))
     problems.push("README.md no longer contains the tested example from src/selftest.ts (README_EXAMPLE)");
+}
+
+// `main` is what `import "mcp-server-fbc-guard"` loads. It must be the pure
+// rules module: importing it must not start a server, print, or keep the
+// process alive. stdin stays open, so a module that starts the stdio server
+// would never exit and is caught by the timeout.
+if (!pkg.main) {
+  problems.push('package.json is missing "main"');
+} else if (existsSync(resolve(root, pkg.main))) {
+  const mainUrl = pathToFileURL(resolve(root, pkg.main)).href;
+  const probe = `const m = await import(${JSON.stringify(mainUrl)}); process.stderr.write(typeof m.checkCode);`;
+  const result = await new Promise((done) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", probe], { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    const timer = setTimeout(() => { child.kill(); done({ timedOut: true, out, err }); }, 10_000);
+    child.on("exit", (code) => { clearTimeout(timer); done({ timedOut: false, code, out, err }); });
+  });
+  if (result.timedOut) problems.push(`importing "main" (${pkg.main}) did not finish within 10 s: it has side effects such as starting a server`);
+  else if (result.out) problems.push(`importing "main" (${pkg.main}) printed to stdout: ${result.out.slice(0, 80)}`);
+  else if (result.err !== "function") problems.push(`importing "main" (${pkg.main}) does not export checkCode (stderr: ${result.err.slice(0, 120)})`);
+  if (pkg.types && pkg.types.replace(/\.d\.ts$/, ".js") !== pkg.main) problems.push(`"types" (${pkg.types}) does not match "main" (${pkg.main})`);
 }
 
 if (problems.length) {

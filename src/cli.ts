@@ -29,13 +29,15 @@ const USAGE = `fbc-guard ${VERSION}: static checks for Meta _fbc / _fbp / fbclid
 Usage:
   fbc-guard <url|file> [<url|file> ...]   check pages (http/https) or local files
   fbc-guard --json <url|file> [...]       print JSON instead of text
+  fbc-guard --allow-private <url> [...]   also allow localhost and private-network URLs
   fbc-guard --selftest                    run only the negative tests
   fbc-guard --help | --version
 
 URLs are fetched together with their same-origin <script src> files.
+Only public hosts are fetched unless --allow-private is given.
 Local files are scanned as they are; list your .js files too.
 
-Exit codes: 0 no rule failed (pass, unknown, or no _fbc code found),
+Exit codes: 0 no rule failed (pass, unknown, warnings only, or no _fbc code),
             1 a rule failed,
             2 self-test failed, bad arguments, or a target could not be read.`;
 
@@ -65,11 +67,11 @@ function fileSource(path: string): Source {
   return { code };
 }
 
-async function checkTarget(target: string): Promise<TargetResult> {
+async function checkTarget(target: string, allowPrivate: boolean): Promise<TargetResult> {
   const kind: Kind = isUrl(target) ? "url" : "file";
   try {
     if (kind === "url") {
-      const b = await fetchBundle(target);
+      const b = await fetchBundle(target, { allowPrivate });
       return {
         target, kind, ...checkCode(b.sources),
         final_url: b.finalUrl, scanned_scripts: b.scripts, skipped_scripts: b.skipped,
@@ -100,6 +102,10 @@ function printText(r: TargetResult): void {
   for (const rule of r.rules ?? []) {
     if (rule.status === "pass") {
       console.log(`  [ ok ] ${rule.id}  ${rule.title}`);
+    } else if (rule.status === "warn") {
+      console.log(`  [warn] ${rule.id}  ${rule.title}`);
+      console.log(`         why: ${rule.protects}`);
+      console.log(`         found: ${rule.evidence}`);
     } else if (rule.status === "unknown") {
       console.log(`  [ ?? ] ${rule.id}  ${rule.title}`);
       console.log(`         could not decide: ${rule.evidence}`);
@@ -115,7 +121,7 @@ function printText(r: TargetResult): void {
 async function main(argv: string[]): Promise<number> {
   const flags = argv.filter((a) => a.startsWith("--"));
   const targets = argv.filter((a) => !a.startsWith("--"));
-  const known = new Set(["--json", "--selftest", "--help", "--version"]);
+  const known = new Set(["--json", "--allow-private", "--selftest", "--help", "--version"]);
   const unknown = flags.filter((f) => !known.has(f));
 
   if (unknown.length) {
@@ -156,7 +162,7 @@ async function main(argv: string[]): Promise<number> {
   const json = flags.includes("--json");
   const results: TargetResult[] = [];
   for (const t of targets) {
-    const r = await checkTarget(t);
+    const r = await checkTarget(t, flags.includes("--allow-private"));
     results.push(r);
     if (!json) printText(r);
   }
@@ -171,6 +177,8 @@ async function main(argv: string[]): Promise<number> {
       `\n${results.length} target(s): ${count("pass")} pass, ${count("fail")} fail, ${count("unknown")} unknown, ` +
         `${count("not_applicable")} not applicable, ${count("error")} error`,
     );
+    const warned = results.filter((r) => r.warnings?.length).length;
+    if (warned) console.log(`${warned} target(s) with warnings. Warnings do not change the exit code.`);
     if (count("unknown"))
       console.log("unknown = no rule failed, but at least one rule could not decide. It is not a full pass.");
     if (count("not_applicable"))

@@ -31,8 +31,8 @@
   },
   "author": "Ads & Code (https://adsandcode.com)",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/rules.js",
+  "types": "dist/rules.d.ts",
   "bin": {
     "mcp-server-fbc-guard": "dist/index.js",
     "fbc-guard": "dist/cli.js"

@@ -1,22 +1,33 @@
 /**
  * Talks to the built server over stdio the way a real MCP client would.
  * Compiling is not evidence that the server answers.
+ *
+ * Two servers are started: one with FBC_GUARD_ALLOW_PRIVATE=1, so it can
+ * check pages served by this script on 127.0.0.1, and one with the default
+ * policy, which must refuse them.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve } from "node:path";
 import { createServer } from "node:http";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dist = resolve(here, "..", "dist");
-const { BAD_FIXTURE, GOOD_FIXTURE, SNIPPET_SECONDS, SNIPPET_MS, CODE_CASES } = await import(
-  pathToFileURL(resolve(dist, "selftest.js")).href
-);
+const load = (f) => import(pathToFileURL(resolve(dist, f)).href);
+const { BAD_FIXTURE, GOOD_FIXTURE, SNIPPET_SECONDS, SNIPPET_MS, CODE_CASES } = await load("selftest.js");
+const { fetchBundle, UNREACHABLE } = await load("fetch.js");
 
-const transport = new StdioClientTransport({ command: process.execPath, args: [resolve(dist, "index.js")] });
-const client = new Client({ name: "fbc-guard-smoke", version: "0.0.0" });
-await client.connect(transport);
+async function startServer(env) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [resolve(dist, "index.js")],
+    env: { ...getDefaultEnvironment(), ...env },
+  });
+  const client = new Client({ name: "fbc-guard-smoke", version: "0.0.0" });
+  await client.connect(transport);
+  return client;
+}
 
 let failures = 0;
 const expect = (label, got, want) => {
@@ -26,51 +37,56 @@ const expect = (label, got, want) => {
 };
 const parse = (r) => JSON.parse(r.content[0].text);
 
+const client = await startServer({ FBC_GUARD_ALLOW_PRIVATE: "1" });
+const call = async (c, name, args) => parse(await c.callTool({ name, arguments: args }));
+
 const { tools } = await client.listTools();
 const names = tools.map((t) => t.name).sort();
 console.log("tools:", names.join(", "));
 expect("tool list", names, ["check_fbc_code", "check_fbc_url"]);
 
-const bad = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: BAD_FIXTURE } }));
-expect("bad code status", bad.status, "fail");
-expect("bad code failed rules", bad.failed, ["FBC-01", "FBC-02", "FBC-06"]);
+const bad = await call(client, "check_fbc_code", { code: BAD_FIXTURE });
+expect("bad code", [bad.status, bad.failed, bad.warnings], ["fail", ["FBC-01", "FBC-02"], ["FBC-06"]]);
 expect("bad code reports every rule", bad.rules.length, 7);
+expect("FBC-06 is reported as warn", bad.rules.find((r) => r.id === "FBC-06").status, "warn");
 
-const good = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: GOOD_FIXTURE } }));
-expect("good code status", good.status, "pass");
-expect("good code failed rules", good.failed, []);
+const good = await call(client, "check_fbc_code", { code: GOOD_FIXTURE });
+expect("good code", [good.status, good.failed, good.warnings], ["pass", [], []]);
 
-const none = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: "<p>no tracking here</p>" } }));
+const none = await call(client, "check_fbc_code", { code: "<p>no tracking here</p>" });
 expect("code without _fbc", none.status, "not_applicable");
 
-const secs = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: SNIPPET_SECONDS } }));
+const secs = await call(client, "check_fbc_code", { code: SNIPPET_SECONDS });
 expect("seconds snippet", [secs.status, secs.failed], ["fail", ["FBC-05"]]);
-const ms = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: SNIPPET_MS } }));
-expect("milliseconds snippet", [ms.status, ms.failed, ms.unknown], ["pass", [], []]);
+const ms = await call(client, "check_fbc_code", { code: SNIPPET_MS });
+expect("milliseconds snippet", [ms.status, ms.failed, ms.unknown, ms.warnings], ["pass", [], [], []]);
 
 const unresolvable = CODE_CASES.find((c) => c.expectStatus === "unknown");
-const unk = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: unresolvable.code } }));
+const unk = await call(client, "check_fbc_code", { code: unresolvable.code });
 expect("unresolvable click ID is unknown, not a failure", [unk.status, unk.failed, unk.unknown], ["unknown", [], ["FBC-01"]]);
 
 // The same JavaScript without <script> tags, read as HTML, has no script to analyse.
 const bare = SNIPPET_SECONDS.replace(/<\/?script>/g, "");
-const asJs = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: bare, kind: "js" } }));
-expect("kind js reads bare JavaScript", asJs.failed, ["FBC-05"]);
-const asHtml = parse(await client.callTool({ name: "check_fbc_code", arguments: { code: bare, kind: "html" } }));
-expect("kind html finds no inline script in bare JavaScript", asHtml.failed, []);
+expect("kind js reads bare JavaScript", (await call(client, "check_fbc_code", { code: bare, kind: "js" })).failed, ["FBC-05"]);
+expect("kind html finds no inline script in bare JavaScript", (await call(client, "check_fbc_code", { code: bare, kind: "html" })).failed, []);
 
 const badUrl = await client.callTool({ name: "check_fbc_url", arguments: { url: "ftp://example.com/" } });
 expect("non-http URL is refused", [parse(badUrl).status, badUrl.isError === true], ["error", true]);
 
-// check_fbc_url against two local servers on different ports, which are
-// different origins. The tracking code lives only in an external same-origin
-// file; the other origin must never receive a request.
-const otherHits = [];
+// Local servers. Different ports are different origins. The tracking code
+// lives only in an external same-origin file; the other origin and the
+// "internal" host on 127.0.0.2 must never receive a request unless allowed.
+const hits = { site: [], other: [], internal: [] };
 const other = createServer((req, res) => {
-  otherHits.push(req.url);
+  hits.other.push(req.url);
   res.end("document.cookie='_fbc=fb.1.'+Date.now()/1000;");
 });
+const internal = createServer((req, res) => {
+  hits.internal.push(req.url);
+  res.end("<html>internal</html>");
+});
 const site = createServer((req, res) => {
+  hits.site.push(req.url);
   const o = `http://127.0.0.1:${other.address().port}`;
   const routes = {
     "/start": () => { res.writeHead(302, { location: "/lp/" }); res.end(); },
@@ -92,24 +108,57 @@ const site = createServer((req, res) => {
       for (let i = 0; i < 3; i++) res.write("/*" + "y".repeat(1024 * 1024) + "*/");
       res.end();
     },
+    "/to-internal": () => { res.writeHead(302, { location: `http://127.0.0.2:${internal.address().port}/secret` }); res.end(); },
   };
   (routes[req.url] ?? (() => { res.statusCode = 404; res.end(); }))();
 });
-await Promise.all([site, other].map((s) => new Promise((ok) => s.listen(0, "127.0.0.1", ok))));
+await Promise.all([
+  new Promise((ok) => site.listen(0, "127.0.0.1", ok)),
+  new Promise((ok) => other.listen(0, "127.0.0.1", ok)),
+  new Promise((ok) => internal.listen(0, "127.0.0.2", ok)),
+]);
 const siteOrigin = `http://127.0.0.1:${site.address().port}`;
 
-const viaUrl = parse(await client.callTool({ name: "check_fbc_url", arguments: { url: `${siteOrigin}/start` } }));
-expect("url: follows the page redirect", viaUrl.final_url, `${siteOrigin}/lp/`);
-expect("url: judges code found in the external file", [viaUrl.status, viaUrl.failed], ["fail", ["FBC-01", "FBC-02", "FBC-06"]]);
-expect("url: scanned scripts", viaUrl.scanned_scripts, [`${siteOrigin}/js/tracking.js`]);
+const viaUrl = await call(client, "check_fbc_url", { url: `${siteOrigin}/start` });
+expect("url (opt-in): follows the page redirect", viaUrl.final_url, `${siteOrigin}/lp/`);
+expect("url (opt-in): judges code found in the external file", [viaUrl.status, viaUrl.failed], ["fail", ["FBC-01", "FBC-02"]]);
+expect("url (opt-in): scanned scripts", viaUrl.scanned_scripts, [`${siteOrigin}/js/tracking.js`]);
 expect(
-  "url: skipped scripts",
+  "url (opt-in): skipped scripts",
   viaUrl.skipped_scripts.map((s) => s.url).sort(),
   [`${siteOrigin}/js/huge-stream.js`, `${siteOrigin}/js/huge.js`, `${siteOrigin}/js/jump.js`, `http://127.0.0.1:${other.address().port}/sdk.js`].sort(),
 );
-expect("url: requests that reached the other origin", otherHits, []);
+expect("url (opt-in): requests that reached the other origin", hits.other, []);
 
-await Promise.all([site, other].map((s) => new Promise((ok) => { s.close(ok); s.closeAllConnections(); })));
+// Default policy: a server started without the opt-in refuses all of this.
+const strict = await startServer({});
+const siteHitsBefore = hits.site.length;
+const refusedLoopback = await strict.callTool({ name: "check_fbc_url", arguments: { url: `${siteOrigin}/lp/` } });
+expect("default: 127.0.0.1 is refused", [parse(refusedLoopback).status, parse(refusedLoopback).error, refusedLoopback.isError], ["error", UNREACHABLE, true]);
+for (const u of [`http://localhost:${site.address().port}/lp/`, `http://[::1]:${site.address().port}/`, "http://169.254.169.254/latest/meta-data/", "http://10.0.0.1/", "http://2130706433/"]) {
+  expect(`default: ${u} is refused`, (await call(strict, "check_fbc_url", { url: u })).error, UNREACHABLE);
+}
+expect("default: no request reached the local site", hits.site.length - siteHitsBefore, 0);
+const unreachable = await call(strict, "check_fbc_url", { url: "http://nothing-here.invalid/" });
+expect("default: an unresolvable host gives the same error as a refused one", unreachable.error, UNREACHABLE);
+
+// Redirect from an allowed host to an internal one. The allowed host here is
+// 127.0.0.1 through a policy that permits exactly that address, standing in
+// for a public page. First prove the redirect is really followed when allowed.
+const toInternal = `${siteOrigin}/to-internal`;
+await fetchBundle(toInternal, { allowPrivate: true });
+expect("control: with everything allowed, the redirect reaches 127.0.0.2", hits.internal.length, 1);
+let redirectError = null;
+try {
+  await fetchBundle(toInternal, { isAllowedAddress: (ip) => ip === "127.0.0.1" });
+} catch (err) {
+  redirectError = err.message;
+}
+expect("redirect to an internal address is refused", redirectError, UNREACHABLE);
+expect("the internal host received no further request", hits.internal.length, 1);
+
+await strict.close();
+await Promise.all([site, other, internal].map((s) => new Promise((ok) => { s.close(ok); s.closeAllConnections(); })));
 await client.close();
 console.log(failures ? `\n${failures} smoke check(s) failed` : "\nall smoke checks passed");
 process.exit(failures ? 1 : 0);

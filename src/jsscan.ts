@@ -13,7 +13,7 @@
  */
 
 /** Replaces the contents of strings, template text and regex literals. Not an identifier, operator or space. */
-export const MASK = "░";
+export const MASK = "\u2591";
 
 export type SourceKind = "html" | "js";
 
@@ -28,7 +28,7 @@ const REGEX_AFTER_WORD = new Set([
   "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
   "throw", "case", "do", "else", "yield", "await",
 ]);
-const isSpace = (c: string) => /\s/.test(c) || c === "﻿";
+const isSpace = (c: string) => /\s/.test(c) || c === "\uFEFF";
 const isIdentStart = (c: string) => /[A-Za-z_$]/.test(c) || c > "\u007f";
 const isIdentPart = (c: string) => /[\w$]/.test(c) || c > "\u007f";
 
@@ -36,12 +36,13 @@ const isIdentPart = (c: string) => /[\w$]/.test(c) || c > "\u007f";
  * Mask comments (with spaces) and the contents of strings, template text and
  * regex literals (with MASK). Quotes and backticks are kept; the `${` and `}`
  * around template expressions are masked and the expressions stay as code.
- * Line breaks are always kept.
+ * Line breaks are always kept. With `keepLiterals`, only comments are masked.
  */
-export function maskJs(src: string): string {
+export function maskJs(src: string, keepLiterals = false): string {
   const n = src.length;
   const out = src.split("");
   const put = (k: number, ch: string) => {
+    if (keepLiterals && ch === MASK) return;
     if (k < n && src[k] !== "\n" && src[k] !== "\r") out[k] = ch;
   };
   const templateDepths: number[] = [];
@@ -201,7 +202,7 @@ export interface Assignment {
 /** `name = expression` assignments (including `var`/`let`/`const` declarators), in source order. */
 export function assignments(m: string): Assignment[] {
   const out: Assignment[] = [];
-  const re = /(?<![\w$\u0080-￿])([A-Za-z_$][\w$]*)\s*=(?![=>])/g;
+  const re = /(?<![\w$\u0080-\uFFFF])([A-Za-z_$][\w$]*)\s*=(?![=>])/g;
   for (const match of m.matchAll(re)) {
     const at = match.index ?? 0;
     const rhsStart = at + match[0].length;
@@ -210,32 +211,87 @@ export function assignments(m: string): Assignment[] {
   return out;
 }
 
-const SCRIPT_BODY = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi;
-
 export function sourceKind(s: Source): SourceKind {
-  return s.kind ?? (/^\s*</.test(s.code.replace(/^﻿/, "")) ? "html" : "js");
+  return s.kind ?? (/^\s*</.test(s.code.replace(/^\uFEFF/, "")) ? "html" : "js");
 }
 
-/** The JavaScript to analyse: inline `<script>` bodies of HTML sources, JavaScript sources as they are. */
-export function scriptUnits(sources: readonly Source[]): string[] {
+const blank = (s: string) => s.replace(/[^\n]/g, " ");
+
+/**
+ * Walk an HTML document once. HTML comments are blanked, so markup that was
+ * commented out is ignored. Each `<script>` body is collected as a unit and,
+ * in the returned text, has its JavaScript comments blanked.
+ */
+export function scanHtml(html: string): { text: string; units: string[] } {
+  const lower = html.toLowerCase();
   const units: string[] = [];
-  for (const s of sources) {
-    if (sourceKind(s) === "js") units.push(s.code);
-    else for (const m of s.code.matchAll(SCRIPT_BODY)) if (m[1].trim()) units.push(m[1]);
+  let text = "";
+  let i = 0;
+  while (i < html.length) {
+    const comment = lower.indexOf("<!--", i);
+    const scriptMatch = /<script\b/g;
+    scriptMatch.lastIndex = i;
+    const sm = scriptMatch.exec(lower);
+    const script = sm ? sm.index : -1;
+    if (comment < 0 && script < 0) {
+      text += html.slice(i);
+      break;
+    }
+    if (comment >= 0 && (script < 0 || comment < script)) {
+      text += html.slice(i, comment);
+      const close = lower.indexOf("-->", comment + 4);
+      const end = close < 0 ? html.length : close + 3;
+      text += blank(html.slice(comment, end));
+      i = end;
+      continue;
+    }
+    text += html.slice(i, script);
+    const openEnd = html.indexOf(">", script);
+    if (openEnd < 0) {
+      text += html.slice(script);
+      break;
+    }
+    const close = lower.indexOf("</script", openEnd + 1);
+    const bodyEnd = close < 0 ? html.length : close;
+    const body = html.slice(openEnd + 1, bodyEnd);
+    if (body.trim()) units.push(body);
+    text += html.slice(script, openEnd + 1) + maskJs(body, true);
+    i = bodyEnd;
   }
-  return units;
+  return { text, units };
 }
 
 export interface JsView {
   /** Script units joined in document order. */
   raw: string;
-  /** `raw` with each unit masked separately, same length. */
+  /** `raw` with each unit masked separately, same length: comments blanked, literal contents masked. */
   masked: string;
 }
 
-/** Join units with a hard statement break so that one unit cannot run into the next. */
-export function jsView(sources: readonly Source[]): JsView {
-  const units = scriptUnits(sources);
+export interface Views {
+  /** Every source with comments blanked (JavaScript and HTML) and string contents intact. */
+  text: string;
+  /** The JavaScript only, for analysis. */
+  js: JsView;
+}
+
+/** Build the views the rules read. Units are joined with a hard statement break so one cannot run into the next. */
+export function buildViews(sources: readonly Source[]): Views {
+  const units: string[] = [];
+  const texts: string[] = [];
+  for (const s of sources) {
+    if (sourceKind(s) === "js") {
+      units.push(s.code);
+      texts.push(maskJs(s.code, true));
+    } else {
+      const h = scanHtml(s.code);
+      units.push(...h.units);
+      texts.push(h.text);
+    }
+  }
   const sep = "\n;\n";
-  return { raw: units.join(sep), masked: units.map(maskJs).join(sep) };
+  return {
+    text: texts.join("\n"),
+    js: { raw: units.join(sep), masked: units.map((u) => maskJs(u)).join(sep) },
+  };
 }

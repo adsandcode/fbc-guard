@@ -11,6 +11,7 @@
 import { checkCode, RULES, type RuleId, type Status } from "./rules.js";
 import { planScripts } from "./fetch.js";
 import { maskJs, statementEnd } from "./jsscan.js";
+import { isBlockedAddress } from "./fetch.js";
 
 /** Original known-bad fixture: writes only when the cookie is missing, decodes twice, hard-codes subdomainIndex. */
 export const BAD_FIXTURE = String.raw`<script>
@@ -107,13 +108,15 @@ export interface CodeCase {
   expectStatus: Status;
   expectFailed: RuleId[];
   expectUnknown?: RuleId[];
+  expectWarnings?: RuleId[];
 }
 
 const fails = (rule: RuleId) => ({ expectStatus: "fail" as const, expectFailed: [rule] });
 const passes = { expectStatus: "pass" as const, expectFailed: [] };
+const warns = (rule: RuleId) => ({ expectStatus: "pass" as const, expectFailed: [], expectWarnings: [rule] });
 
 export const CODE_CASES: CodeCase[] = [
-  { name: "original bad fixture", code: BAD_FIXTURE, expectStatus: "fail", expectFailed: ["FBC-01", "FBC-02", "FBC-06"] },
+  { name: "original bad fixture", code: BAD_FIXTURE, expectStatus: "fail", expectFailed: ["FBC-01", "FBC-02"], expectWarnings: ["FBC-06"] },
   { name: "original good fixture", code: GOOD_FIXTURE, ...passes },
   { name: "README example", code: README_EXAMPLE, ...passes },
 
@@ -128,7 +131,7 @@ export const CODE_CASES: CodeCase[] = [
     code: variant(WRITE, "document.cookie=`_fbc=fb.${sdi}.${Math.floor(Date.now()/1000)}.${fbclid};path=/;domain=.${root}`;"),
     ...fails("FBC-05"),
   },
-  { name: "FBC-06 only: hard-coded subdomainIndex", code: variant(WRITE, WRITE.replace("'_fbc=fb.'+sdi+'.'", "'_fbc=fb.1.'")), ...fails("FBC-06") },
+  { name: "FBC-06 only: hard-coded subdomainIndex (warning)", code: variant(WRITE, WRITE.replace("'_fbc=fb.'+sdi+'.'", "'_fbc=fb.1.'")), ...warns("FBC-06") },
   {
     name: "FBP-01 only: _fbp creationTime in seconds, template literal",
     code: variant(WRITE, WRITE + "\n  document.cookie=`_fbp=fb.${sdi}.${Math.floor(Date.now()/1000)}.${Math.floor(Math.random()*1e10)};path=/`;"),
@@ -154,6 +157,13 @@ export const CODE_CASES: CodeCase[] = [
     code: snippet("var home='https://example.com/';if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor(Date.now()/1000)+'.'+f;}"),
     ...fails("FBC-05"),
   },
+
+  { name: "FBC-05 seconds: Math.floor(new Date()/1000)", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor(new Date()/1000)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: new Date()/1e3|0", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+(new Date()/1e3|0)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: Math.floor((new Date)/1000)", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor((new Date)/1000)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "FBC-05 seconds: d.getTime()/1000 for a Date in a variable", code: snippet("var d=new Date();if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor(d.getTime()/1000)+'.'+f;}"), ...fails("FBC-05") },
+  { name: "ms: t0.getTime()/1000 in another statement", code: snippet("var t0=new Date();" + WRITE_MS + "window.onbeforeunload=function(){var stay=Math.round(t0.getTime()/1000);};"), ...passes },
+  { name: "FBC-05 seconds: Math.floor(new Date().getTime()/1000)", code: snippet("if(f&&id!==f){document.cookie='_fbc=fb.'+i+'.'+Math.floor(new Date().getTime()/1000)+'.'+f;}"), ...fails("FBC-05") },
 
   // FBP-01 variants.
   { name: "FBP-01 seconds: concatenated", code: snippet(WRITE_MS + "document.cookie='_fbp=fb.'+i+'.'+Math.floor(Date.now()/1000)+'.'+Math.floor(Math.random()*1e10);"), ...fails("FBP-01") },
@@ -212,6 +222,19 @@ export const CODE_CASES: CodeCase[] = [
     code: "function saveClick(cid){var s=storedClickId();if(s!==cid){document.cookie='_fbc=fb.'+sdi()+'.'+Date.now()+'.'+cid;}}",
     expectStatus: "unknown", expectFailed: [], expectUnknown: ["FBC-01"],
   },
+
+  // Comments, prose in strings and commented-out markup are not code.
+  { name: "comment: README-style line mentioning decodeURIComponent(fbclid)", code: variant(READ, "// don't use decodeURIComponent(fbclid)\n" + READ), ...passes },
+  { name: "comment: block comment mentioning fbclid.toLowerCase()", code: variant(READ, "/* never call fbclid.toLowerCase() */\n" + READ), ...passes },
+  { name: "comment: fbclid.slice( in a comment at the end of a line", code: variant(READ, READ + " // fbclid.slice(0,10) would truncate it"), ...passes },
+  { name: "string: a warning message that mentions decodeURIComponent(fbclid)", code: variant(READ, "console.warn('do not call decodeURIComponent(fbclid) twice');\n" + READ), ...passes },
+  { name: "comment: old hard-coded _fbc=fb.1. value in a comment", code: variant(READ, "// was: '_fbc=fb.1.'+Date.now()\n" + READ), ...passes },
+  {
+    name: "HTML comment: a commented-out old script",
+    code: "<!-- <script>var fbclid=new URLSearchParams(location.search).get('fbclid');document.cookie='_fbc=fb.1.'+decodeURIComponent(fbclid);</script> -->\n" + GOOD_FIXTURE,
+    ...passes,
+  },
+  { name: "comment control: code after a block comment still fails", code: variant(READ, "/* note */ fbclid=fbclid&&fbclid.toLowerCase();\n" + READ), ...fails("FBC-03") },
 
   {
     name: "no _fbc at all is not applicable, even with a broken fbclid line",
@@ -278,6 +301,40 @@ const SCANNER_CASES = [
   { name: "line break after an operator continues", src: "a=b+\nc\nd", statement: "a=b+\nc" },
 ];
 
+/** [address, refused by default]. */
+export const ADDRESS_CASES: [string, boolean][] = [
+  ["127.0.0.1", true],
+  ["127.255.0.9", true],
+  ["10.1.2.3", true],
+  ["172.16.0.1", true],
+  ["172.31.255.255", true],
+  ["192.168.1.1", true],
+  ["169.254.169.254", true],
+  ["100.64.0.1", true],
+  ["0.0.0.0", true],
+  ["224.0.0.1", true],
+  ["255.255.255.255", true],
+  ["::", true],
+  ["::1", true],
+  ["fc00::1", true],
+  ["fd12:3456::1", true],
+  ["fe80::1", true],
+  ["fe80::1%eth0", true],
+  ["ff02::1", true],
+  ["::ffff:127.0.0.1", true],
+  ["::ffff:7f00:1", true],
+  ["::ffff:169.254.169.254", true],
+  ["64:ff9b::a00:1", true],
+  ["2002:c0a8:101::1", true],
+  ["not-an-ip", true],
+  ["8.8.8.8", false],
+  ["172.32.0.1", false],
+  ["100.128.0.1", false],
+  ["93.184.215.14", false],
+  ["2606:4700:4700::1111", false],
+  ["::ffff:8.8.8.8", false],
+];
+
 const same = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -299,20 +356,30 @@ export function run(log: (s: string) => void = console.log): boolean {
   for (const c of CODE_CASES) {
     const r = checkCode(c.code);
     const expectUnknown = c.expectUnknown ?? [];
-    const ok = r.status === c.expectStatus && same(r.failed, c.expectFailed) && same(r.unknown, expectUnknown);
-    const fmt = (s: string, f: readonly string[], u: readonly string[]) =>
-      `${s} [${f.join(",")}]` + (u.length ? ` ?[${u.join(",")}]` : "");
-    const want = fmt(c.expectStatus, c.expectFailed, expectUnknown);
-    const got = fmt(r.status, r.failed, r.unknown);
+    const expectWarnings = c.expectWarnings ?? [];
+    const ok =
+      r.status === c.expectStatus && same(r.failed, c.expectFailed) &&
+      same(r.unknown, expectUnknown) && same(r.warnings, expectWarnings);
+    const fmt = (s: string, f: readonly string[], u: readonly string[], w: readonly string[]) =>
+      `${s} [${f.join(",")}]` + (u.length ? ` ?[${u.join(",")}]` : "") + (w.length ? ` w[${w.join(",")}]` : "");
+    const want = fmt(c.expectStatus, c.expectFailed, expectUnknown, expectWarnings);
+    const got = fmt(r.status, r.failed, r.unknown, r.warnings);
     record(ok, `expected ${want.padEnd(30)} got ${got.padEnd(30)} ${c.name}`);
   }
 
-  // Each rule must be shown to fail on its own somewhere above.
+  // Each rule must be shown to fire on its own somewhere above (fail, or warn for a warning-level rule).
   for (const rule of RULES) {
-    const isolated = CODE_CASES.some(
-      (c) => c.expectFailed.length === 1 && c.expectFailed[0] === rule.id,
-    );
-    record(isolated, `${rule.id} has a fixture that fails it and no other rule`);
+    const isolated = CODE_CASES.some((c) => {
+      const fired = [...c.expectFailed, ...(c.expectWarnings ?? [])];
+      return fired.length === 1 && fired[0] === rule.id;
+    });
+    record(isolated, `${rule.id} has a fixture that fires it and no other rule`);
+  }
+
+  log("  address policy (default: public hosts only)");
+  for (const [ip, blocked] of ADDRESS_CASES) {
+    const got = isBlockedAddress(ip);
+    record(got === blocked, `${blocked ? "refuse" : "allow "} ${ip}`);
   }
 
   log("  script fetching");
