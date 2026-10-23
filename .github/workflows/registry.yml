@@ -1,0 +1,35 @@
+name: registry
+
+# Publish server.json to the MCP Registry without a new npm release, for example
+# when the npm package was published by hand. Uses the workflow's OIDC token, so
+# nobody has to log in interactively. Run it from the Actions tab or the API.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: server.json version must already be on npm
+        run: |
+          V="$(node -p "require('./server.json').version")"
+          N="$(node -p "require('./package.json').name")"
+          curl -fsS "https://registry.npmjs.org/$N/$V" > /dev/null
+
+      - name: Install mcp-publisher (pinned, checksum verified)
+        run: |
+          V=1.8.1
+          F=mcp-publisher_linux_amd64.tar.gz
+          curl -fsSL -o "$F" "https://github.com/modelcontextprotocol/registry/releases/download/v$V/$F"
+          curl -fsSL -o sums.txt "https://github.com/modelcontextprotocol/registry/releases/download/v$V/registry_${V}_checksums.txt"
+          grep " $F\$" sums.txt | sha256sum -c -
+          tar xzf "$F" mcp-publisher
+
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish

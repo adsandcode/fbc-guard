@@ -37,6 +37,19 @@ jobs:
       # prepublishOnly builds, runs the selftest, the smoke test and the publish checks.
       - run: npm publish --access public
 
+      # npm can take a minute to serve a new version; the MCP Registry rejects
+      # versions it cannot see yet, so wait for it instead of failing the release.
+      - name: Wait until npm serves this version
+        run: |
+          N="$(node -p "require('./package.json').name")"
+          V="$(node -p "require('./package.json').version")"
+          for i in $(seq 1 30); do
+            curl -fsS "https://registry.npmjs.org/$N/$V" > /dev/null && exit 0
+            sleep 10
+          done
+          echo "npm still does not serve $N@$V after 5 minutes"
+          exit 1
+
       - name: Install mcp-publisher (pinned, checksum verified)
         run: |
           V=1.8.1
